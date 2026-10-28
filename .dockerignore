@@ -1,0 +1,18 @@
+.venv
+.git
+.github
+.claude
+.env
+.env.*
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+Dockerfile
+.dockerignore
+# local-only helpers (reset_local_db.sh DROPS the database): never ship them
+scripts/reset_local_db.sh
+scripts/setup_local_db.sh
+scripts/seed_demo.py
+.DS_Store

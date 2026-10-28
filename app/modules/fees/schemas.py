@@ -11,6 +11,7 @@ class PaymentIn(BaseModel):
     trx_id: str | None = Field(default=None, max_length=60)
     note: str | None = Field(default=None, max_length=300)
     due_ids: list[uuid.UUID] | None = None  # pick specific months first (optional)
+    send_receipt: bool = True  # untick to skip the receipt SMS for this payment
 
 
 class AllocationOut(BaseModel):
@@ -85,6 +86,21 @@ class PaymentOut(BaseModel):
     reversed: bool
     reversal_reason: str | None
     months: list[date]
+    batch_names: list[str] = []
+
+
+class FeeOverview(BaseModel):
+    """Numbers for the fee page header: one month's collection plus today's and all open dues."""
+
+    month: date
+    collected: int
+    billed: int  # this month's fees after discounts: the collection target
+    today_amount: int
+    today_count: int
+    today_receipts: int  # receipt SMS queued today
+    total_due: int
+    due_students: int
+    by_method: dict[str, int]
 
 
 class LedgerOut(BaseModel):

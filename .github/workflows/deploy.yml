@@ -1,0 +1,142 @@
+name: Deploy api
+
+# Tests run on every push and PR. Only a push to main (or a manual run) builds the
+# image, migrates the database and restarts the API container. The web container
+# and the database container are never recreated by this pipeline.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-api-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Must be lowercase: Docker rejects uppercase letters in image names.
+  IMAGE: ghcr.io/sabbirbracu/batchpilot-api
+  APP_DIR: /opt/batchpilot
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # CI-only throwaway database: no passwords needed, connect as the `postgres` superuser.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # scripts/setup_local_db.sh calls .venv/bin/alembic, so the venv must be named .venv.
+      - name: Install dependencies
+        run: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+      - name: Create the test database, roles and schema
+        run: DB=batchpilot_test bash scripts/setup_local_db.sh
+      - name: Run tests
+        run: .venv/bin/python -m pytest -q
+      # Not a gate yet: 36 existing lint findings. Run `ruff check --fix .` locally, then
+      # delete `continue-on-error` to make lint a real gate.
+      - name: Lint
+        continue-on-error: true
+        run: .venv/bin/ruff check .
+
+  build-and-push:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # sha = a permanent tag you can roll back to; latest = convenience.
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          # The server's identity is pinned in a secret, so we only ever talk to the real server.
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Pull, migrate, then restart the api container
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+        run: |
+          SSH="ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes $DEPLOY_USER@$DEPLOY_HOST"
+          # A private Docker config folder for this app, so our short-lived GHCR login
+          # never overwrites the logins other deployments keep in ~/.docker.
+          printf '%s' "$GHCR_TOKEN" | $SSH "export DOCKER_CONFIG=$APP_DIR/.docker && docker login ghcr.io -u $ACTOR --password-stdin"
+          # Order matters: new image -> migrate the schema -> only then restart the API.
+          # `set -e` makes a failed migration stop the deploy with the OLD api still running.
+          # Migrations must stay backward compatible: the old api runs against the new schema
+          # for a few seconds (add columns/tables first, remove old ones in a later release).
+          $SSH "set -e; export DOCKER_CONFIG=$APP_DIR/.docker API_TAG=$SHA; cd $APP_DIR; docker compose pull api; docker compose run --rm migrate; docker compose up -d --no-deps api; docker image prune -f"
+
+      - name: Wait until the container is healthy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$DEPLOY_USER@$DEPLOY_HOST" bash -s <<'REMOTE'
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' batchpilot-api 2>/dev/null || true)
+            if [ "$s" = "healthy" ]; then echo "healthy after ${i} checks"; exit 0; fi
+            sleep 3
+          done
+          echo "batchpilot-api did not become healthy"; docker logs --tail 40 batchpilot-api; exit 1
+          REMOTE
+
+      # Only runs once you set the SITE_URL variable (after DNS + HTTPS work).
+      - name: Check the live API
+        if: ${{ vars.SITE_URL != '' }}
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 \
+            -o /dev/null "${{ vars.SITE_URL }}/api/health"

@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import Integer, and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import TenantContext
@@ -10,6 +10,7 @@ from app.core.security import new_qr_token
 from app.core.timeutil import add_months, current_month, today_local
 from app.modules.academics.models import Batch, Enrollment, Student
 from app.modules.academics.schemas import EnrollmentIn, EnrollmentOut, StudentIn, StudentOut
+from app.modules.attendance.models import AttendanceRecord
 from app.modules.audit import service as audit
 from app.modules.fees import service as fees
 from app.modules.fees.models import FeeDue
@@ -172,6 +173,7 @@ def outstanding_subquery():
             FeeDue.student_id.label("student_id"),
             func.sum(FeeDue.amount - FeeDue.discount - FeeDue.paid_amount).label("outstanding"),
             func.count().label("due_months"),
+            func.bool_or(FeeDue.paid_amount > 0).label("partial"),
         )
         .where(FeeDue.status.in_(fees.OPEN), FeeDue.month <= cm)
         .group_by(FeeDue.student_id)
@@ -192,11 +194,48 @@ def batch_names_subquery():
     )
 
 
-def student_out(st: Student, outstanding: int | None, due_months: int | None, batch_names: list[str] | None) -> StudentOut:
+def month_attendance_subquery():
+    """Each student's attendance this month across all their batches, as a rounded %."""
+    cm = current_month()
+    return (
+        select(
+            AttendanceRecord.student_id.label("student_id"),
+            func.round(100.0 * func.count().filter(AttendanceRecord.status != "absent") / func.count())
+            .cast(Integer)
+            .label("rate"),
+        )
+        .where(AttendanceRecord.date >= cm, AttendanceRecord.date < add_months(cm, 1))
+        .group_by(AttendanceRecord.student_id)
+        .subquery()
+    )
+
+
+def student_query():
+    """Students with their open dues, batch names and this month's attendance, ready to filter."""
+    dues, names, att = outstanding_subquery(), batch_names_subquery(), month_attendance_subquery()
+    q = (
+        select(Student, dues.c.outstanding, dues.c.due_months, dues.c.partial, names.c.batch_names, att.c.rate)
+        .outerjoin(dues, dues.c.student_id == Student.id)
+        .outerjoin(names, names.c.student_id == Student.id)
+        .outerjoin(att, att.c.student_id == Student.id)
+    )
+    return q, dues
+
+
+def student_out(
+    st: Student,
+    outstanding: int | None,
+    due_months: int | None,
+    partial: bool | None,
+    batch_names: list[str] | None,
+    attendance: int | None,
+) -> StudentOut:
     out = StudentOut.model_validate(st)
     out.outstanding = int(outstanding or 0)
     out.due_months = int(due_months or 0)
+    out.partial = bool(partial) and out.outstanding > 0
     out.batch_names = list(batch_names or [])
+    out.month_attendance = attendance
     return out
 
 
@@ -210,8 +249,7 @@ async def search_students(
     cursor: uuid.UUID | None,
     limit: int,
 ) -> tuple[list[StudentOut], uuid.UUID | None, int]:
-    dues = outstanding_subquery()
-    names = batch_names_subquery()
+    base, dues = student_query()
     conds = [Student.deleted_at.is_(None)]
     if status:
         conds.append(Student.status == status)
@@ -237,18 +275,13 @@ async def search_students(
     elif has_due is False:
         conds.append(or_(dues.c.outstanding.is_(None), dues.c.outstanding <= 0))
 
-    base = (
-        select(Student, dues.c.outstanding, dues.c.due_months, names.c.batch_names)
-        .outerjoin(dues, dues.c.student_id == Student.id)
-        .outerjoin(names, names.c.student_id == Student.id)
-        .where(and_(*conds))
-    )
+    base = base.where(and_(*conds))
     total = await db.scalar(select(func.count()).select_from(base.subquery()))
     page_q = base.order_by(Student.id).limit(limit + 1)
     if cursor:
         page_q = page_q.where(Student.id > cursor)
     rows = (await db.execute(page_q)).all()
-    items = [student_out(s, o, m, n) for s, o, m, n in rows[:limit]]
+    items = [student_out(*row) for row in rows[:limit]]
     next_cursor = rows[limit - 1][0].id if len(rows) > limit else None
     return items, next_cursor, int(total or 0)
 

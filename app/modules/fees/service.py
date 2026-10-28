@@ -228,6 +228,7 @@ async def record_payment(
     trx_id: str | None = None,
     note: str | None = None,
     due_ids: list[uuid.UUID] | None = None,
+    send_receipt: bool = True,
 ) -> PaymentResult:
     t.require("payment.record")
     db, inst = t.db, t.institution
@@ -309,7 +310,7 @@ async def record_payment(
         d.status = due_status(d.amount, d.discount, d.paid_amount)
 
     result = PaymentResult(payment, plan)
-    if inst.settings.get("receipt_sms", True) and student.guardian_phone:
+    if send_receipt and inst.settings.get("receipt_sms", True) and student.guardian_phone:
         msg = await messaging.enqueue(
             db,
             institution_id=inst.id,

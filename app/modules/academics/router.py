@@ -1,16 +1,17 @@
 import uuid
 
 from fastapi import APIRouter, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import Integer, and_, func, select
 
 from app.core.deps import Tenant
 from app.core.errors import AppError
 from app.core.phone import normalize_optional
-from app.core.timeutil import current_month, now_utc, today_local
+from app.core.timeutil import add_months, current_month, now_utc, today_local
 from app.modules.academics import service
 from app.modules.academics.models import Batch, Enrollment, Student
 from app.modules.academics.schemas import (
     BatchIn,
+    BatchMemberOut,
     BatchOut,
     BatchUpdate,
     EnrollmentIn,
@@ -19,6 +20,7 @@ from app.modules.academics.schemas import (
     StudentIn,
     StudentOut,
     StudentPage,
+    StudentSummary,
     StudentUpdate,
 )
 from app.modules.attendance.models import AttendanceRecord, AttendanceSession
@@ -56,13 +58,29 @@ async def _batch_stats(t: Tenant, batch_ids: list[uuid.UUID]) -> dict[uuid.UUID,
             FeeDue.batch_id,
             func.coalesce(func.sum(FeeDue.paid_amount), 0),
             func.coalesce(func.sum(FeeDue.amount - FeeDue.discount - FeeDue.paid_amount), 0),
+            func.count(func.distinct(FeeDue.student_id)).filter(FeeDue.amount - FeeDue.discount - FeeDue.paid_amount > 0),
         )
         .where(FeeDue.batch_id.in_(batch_ids), FeeDue.month == cm)
         .group_by(FeeDue.batch_id)
     )
-    for bid, collected, due in money:
+    for bid, collected, due, owing in money:
         stats[bid]["month_collected"] = int(collected)
         stats[bid]["month_due"] = int(due)
+        stats[bid]["due_students"] = int(owing)
+
+    for key, month in (("month_attendance", cm), ("last_month_attendance", add_months(cm, -1))):
+        rates = await db.execute(
+            select(AttendanceSession.batch_id, _rate())
+            .join(AttendanceRecord, AttendanceRecord.session_id == AttendanceSession.id)
+            .where(
+                AttendanceSession.batch_id.in_(batch_ids),
+                AttendanceSession.date >= month,
+                AttendanceSession.date < add_months(month, 1),
+            )
+            .group_by(AttendanceSession.batch_id)
+        )
+        for bid, rate in rates:
+            stats[bid][key] = rate
 
     att = await db.execute(
         select(
@@ -78,6 +96,11 @@ async def _batch_stats(t: Tenant, batch_ids: list[uuid.UUID]) -> dict[uuid.UUID,
         stats[bid]["today_present"] = present
         stats[bid]["today_absent"] = absent
     return stats
+
+
+def _rate():
+    """% of attendance records that are not absences, rounded."""
+    return func.round(100.0 * func.count().filter(AttendanceRecord.status != "absent") / func.count()).cast(Integer)
 
 
 def _batch_out(b: Batch, stats: dict) -> BatchOut:
@@ -114,6 +137,61 @@ async def get_batch(batch_id: uuid.UUID, t: Tenant):
     b = await service.get_batch(t.db, batch_id)
     stats = await _batch_stats(t, [b.id])
     return _batch_out(b, stats.get(b.id, {}))
+
+
+@router.get("/batches/{batch_id}/members", response_model=list[BatchMemberOut])
+async def batch_members(batch_id: uuid.UUID, t: Tenant):
+    """Active students of a batch, in roll order, with this month's fee and attendance in this batch."""
+    db, cm = t.db, current_month()
+    await service.get_batch(db, batch_id)
+    dues = service.outstanding_subquery()
+    month_due = (
+        select(
+            FeeDue.student_id.label("student_id"),
+            func.sum(FeeDue.amount - FeeDue.discount).label("amount"),
+            func.sum(FeeDue.paid_amount).label("paid"),
+            func.max(FeeDue.status).label("status"),
+        )
+        .where(FeeDue.batch_id == batch_id, FeeDue.month == cm)
+        .group_by(FeeDue.student_id)
+        .subquery()
+    )
+    att = (
+        select(AttendanceRecord.student_id.label("student_id"), _rate().label("rate"))
+        .join(AttendanceSession, AttendanceSession.id == AttendanceRecord.session_id)
+        .where(
+            AttendanceSession.batch_id == batch_id,
+            AttendanceSession.date >= cm,
+            AttendanceSession.date < add_months(cm, 1),
+        )
+        .group_by(AttendanceRecord.student_id)
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(Student, month_due.c.amount, month_due.c.paid, month_due.c.status, dues.c.outstanding, att.c.rate)
+            .join(Enrollment, Enrollment.student_id == Student.id)
+            .outerjoin(month_due, month_due.c.student_id == Student.id)
+            .outerjoin(dues, dues.c.student_id == Student.id)
+            .outerjoin(att, att.c.student_id == Student.id)
+            .where(
+                Enrollment.batch_id == batch_id,
+                Enrollment.end_month.is_(None),
+                Enrollment.deleted_at.is_(None),
+                Student.status == "active",
+                Student.deleted_at.is_(None),
+            )
+            .order_by(func.length(Student.roll_no), Student.roll_no)
+        )
+    ).all()
+    return [
+        BatchMemberOut(
+            student_id=s.id, roll_no=s.roll_no, name=s.name, guardian_phone=s.guardian_phone,
+            month_amount=int(amount or 0), month_paid=int(paid or 0), month_status=status,
+            outstanding=int(outstanding or 0), attendance=rate,
+        )
+        for s, amount, paid, status, outstanding, rate in rows
+    ]
 
 
 @router.patch("/batches/{batch_id}", response_model=BatchOut)
@@ -178,19 +256,33 @@ async def create_student(body: StudentIn, t: Tenant):
 
 
 async def _student_full(t: Tenant, student_id: uuid.UUID) -> StudentOut:
-    dues = service.outstanding_subquery()
-    names = service.batch_names_subquery()
-    row = (
-        await t.db.execute(
-            select(Student, dues.c.outstanding, dues.c.due_months, names.c.batch_names)
-            .outerjoin(dues, dues.c.student_id == Student.id)
-            .outerjoin(names, names.c.student_id == Student.id)
-            .where(and_(Student.id == student_id, Student.deleted_at.is_(None)))
-        )
-    ).first()
+    q, _ = service.student_query()
+    row = (await t.db.execute(q.where(and_(Student.id == student_id, Student.deleted_at.is_(None))))).first()
     if not row:
         await service.get_student(t.db, student_id)  # raises not_found
     return service.student_out(*row)
+
+
+@router.get("/students/summary", response_model=StudentSummary)
+async def student_summary(t: Tenant):
+    """Counts for the students page header tiles."""
+    cm = current_month()
+    dues = service.outstanding_subquery()
+    active = Student.status == "active"
+    row = (
+        await t.db.execute(
+            select(
+                func.count().filter(active),
+                func.count().filter(active, Student.joined_at >= cm),
+                func.count().filter(active, dues.c.outstanding > 0),
+                func.count().filter(Student.status == "left"),
+            )
+            .select_from(Student)
+            .outerjoin(dues, dues.c.student_id == Student.id)
+            .where(Student.deleted_at.is_(None))
+        )
+    ).one()
+    return StudentSummary(active=row[0], joined_this_month=row[1], with_due=row[2], left=row[3])
 
 
 @router.get("/students/{student_id}", response_model=StudentOut)

@@ -54,6 +54,23 @@ class BatchOut(BaseModel):
     month_due: int = 0
     today_present: int | None = None
     today_absent: int | None = None
+    due_students: int = 0  # students with something left on this month's fee
+    month_attendance: int | None = None  # % present/late this month, None before the first session
+    last_month_attendance: int | None = None
+
+
+class BatchMemberOut(BaseModel):
+    """One row of a batch's student table: this month's fee for this batch and attendance here."""
+
+    student_id: uuid.UUID
+    roll_no: str
+    name: str
+    guardian_phone: str | None
+    month_amount: int = 0  # fee after discount, poisha; 0 when no due exists yet
+    month_paid: int = 0
+    month_status: str | None = None  # due | partial | paid | waived
+    outstanding: int = 0  # all open dues of the student, any batch
+    attendance: int | None = None  # % this month in this batch
 
 
 class EnrollmentIn(BaseModel):
@@ -119,7 +136,16 @@ class StudentOut(BaseModel):
     version: int
     outstanding: int = 0
     due_months: int = 0
+    partial: bool = False  # part of an open due is already paid
     batch_names: list[str] = []
+    month_attendance: int | None = None  # % this month across all batches
+
+
+class StudentSummary(BaseModel):
+    active: int
+    joined_this_month: int
+    with_due: int
+    left: int
 
 
 class StudentPage(BaseModel):

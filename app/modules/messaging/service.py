@@ -14,6 +14,7 @@ from app.core.timeutil import DHAKA, local_day_bounds_utc, now_utc
 from app.modules.messaging.models import MessageTemplate, OutboxMessage
 from app.modules.messaging.templates import (
     CAP_EXEMPT,
+    DEFAULT_NOTICE_TEMPLATES,
     DEFAULT_TEMPLATES,
     PRIORITY,
     count_segments,
@@ -28,7 +29,11 @@ async def ensure_default_templates(db: AsyncSession, institution_id: uuid.UUID) 
         {"institution_id": institution_id, "key": k, "body_bn": v["bn"], "body_en": v["en"]}
         for k, v in DEFAULT_TEMPLATES.items()
     ]
-    stmt = insert(MessageTemplate).values([{"id": new_id(), **r} for r in rows])
+    rows += [
+        {"institution_id": institution_id, "key": k, "name": v["name"], "body_bn": v["bn"], "body_en": None}
+        for k, v in DEFAULT_NOTICE_TEMPLATES.items()
+    ]
+    stmt = insert(MessageTemplate).values([{"id": new_id(), "name": None, **r} for r in rows])
     await db.execute(stmt.on_conflict_do_nothing(index_elements=["institution_id", "key"]))
 
 
@@ -52,6 +57,7 @@ async def enqueue(
     values: dict,
     dedupe_key: str,
     student_id: uuid.UUID | None = None,
+    not_before: datetime | None = None,
 ) -> OutboxMessage | None:
     """Queue one SMS. Returns None when skipped (no phone, template off, or duplicate)."""
     if not to_phone:
@@ -69,7 +75,9 @@ async def enqueue(
     body = render(body_src, values)
 
     now = now_utc()
-    send_after, held = next_allowed_send_time(now)
+    # A scheduled notice waits for its time; the quiet-hours rule still applies on top.
+    send_after, held = next_allowed_send_time(max(now, not_before or now))
+    held = held or send_after > now
 
     if template_key not in CAP_EXEMPT:
         start, end = local_day_bounds_utc(send_after.astimezone(DHAKA).date())

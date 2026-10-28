@@ -15,6 +15,7 @@ class MessageTemplate(IdMixin, TimestampMixin, Base):
 
     institution_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("institutions.id"), nullable=False)
     key: Mapped[str] = mapped_column(String(30), nullable=False)
+    name: Mapped[str | None] = mapped_column(String(60))  # notice templates only; automatic ones are named by key
     body_bn: Mapped[str] = mapped_column(Text, nullable=False)
     body_en: Mapped[str | None] = mapped_column(Text)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

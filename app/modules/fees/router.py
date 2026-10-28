@@ -2,12 +2,13 @@ import uuid
 from datetime import date
 
 from fastapi import APIRouter, Header, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.orm import aliased
 
 from app.core.deps import Tenant
 from app.core.errors import AppError, not_found
-from app.core.timeutil import current_month, local_day_bounds_utc, parse_month, today_local
+from app.core.timeutil import add_months, current_month, local_day_bounds_utc, parse_month, today_local
+from app.modules.academics import service as academics
 from app.modules.academics.models import Batch, Enrollment, Student
 from app.modules.audit import service as audit
 from app.modules.fees import service
@@ -19,6 +20,7 @@ from app.modules.fees.schemas import (
     DueOut,
     DuesPage,
     DueStudentRow,
+    FeeOverview,
     GenerateIn,
     LedgerOut,
     PaymentIn,
@@ -28,6 +30,9 @@ from app.modules.fees.schemas import (
     ReverseIn,
 )
 from app.modules.identity.models import User
+from app.modules.messaging.models import OutboxMessage
+
+Rev = aliased(Payment)
 
 router = APIRouter(prefix="/fees", tags=["fees"])
 
@@ -57,6 +62,7 @@ async def record_payment(
         trx_id=body.trx_id,
         note=body.note,
         due_ids=body.due_ids,
+        send_receipt=body.send_receipt,
     )
     p = res.payment
     st = await t.db.get(Student, p.student_id)
@@ -105,15 +111,65 @@ async def _payments(t: Tenant, conds: list, limit: int) -> list[PaymentOut]:
         ):
             if m not in months[pid]:
                 months[pid].append(m)
+    names = academics.batch_names_subquery()
+    batch_names = dict(
+        (await t.db.execute(select(names.c.student_id, names.c.batch_names).where(names.c.student_id.in_({r[0].student_id for r in rows})))).all()
+    ) if rows else {}
     return [
         PaymentOut(
             id=p.id, student_id=p.student_id, student_name=sname, roll_no=roll, kind=p.kind, amount=p.amount,
             method=p.method, trx_id=p.trx_id, note=p.note, received_by=p.received_by, received_by_name=rname,
             received_at=p.received_at, reversed=rev_id is not None, reversal_reason=p.reversal_reason,
-            months=months.get(p.id, []),
+            months=months.get(p.id, []), batch_names=list(batch_names.get(p.student_id) or []),
         )
         for p, sname, roll, rname, rev_id in rows
     ]
+
+
+@router.get("/overview", response_model=FeeOverview)
+async def fee_overview(t: Tenant, month: str | None = None):
+    """Collection for one month (default: this one) against what was billed, today's takings and open dues."""
+    db = t.db
+    m = parse_month(month) if month else current_month()
+    start, end = local_day_bounds_utc(m)[0], local_day_bounds_utc(add_months(m, 1))[0]
+    live = and_(Payment.kind == "payment", ~exists().where(Rev.reverses_payment_id == Payment.id))
+    by_method = dict(
+        (
+            await db.execute(
+                select(Payment.method, func.sum(Payment.amount))
+                .where(live, Payment.received_at >= start, Payment.received_at < end)
+                .group_by(Payment.method)
+            )
+        ).all()
+    )
+    billed = await db.scalar(select(func.coalesce(func.sum(FeeDue.amount - FeeDue.discount), 0)).where(FeeDue.month == m))
+    t0, t1 = local_day_bounds_utc(today_local())
+    today_amount, today_count = (
+        await db.execute(
+            select(func.coalesce(func.sum(Payment.amount), 0), func.count(func.distinct(Payment.student_id))).where(
+                live, Payment.received_at >= t0, Payment.received_at < t1
+            )
+        )
+    ).one()
+    receipts = await db.scalar(
+        select(func.count()).select_from(OutboxMessage).where(
+            OutboxMessage.template_key == "receipt", OutboxMessage.created_at >= t0, OutboxMessage.created_at < t1
+        )
+    )
+    dues = academics.outstanding_subquery()
+    total_due, due_students = (
+        await db.execute(
+            select(func.coalesce(func.sum(dues.c.outstanding), 0), func.count().filter(dues.c.outstanding > 0))
+            .select_from(dues)
+            .join(Student, Student.id == dues.c.student_id)
+            .where(Student.deleted_at.is_(None))
+        )
+    ).one()
+    return FeeOverview(
+        month=m, collected=int(sum(by_method.values())), billed=int(billed or 0),
+        today_amount=int(today_amount), today_count=int(today_count), today_receipts=int(receipts or 0),
+        total_due=int(total_due), due_students=int(due_students), by_method={k: int(v) for k, v in by_method.items()},
+    )
 
 
 @router.get("/payments", response_model=list[PaymentOut])

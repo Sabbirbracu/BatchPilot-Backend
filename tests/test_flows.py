@@ -188,3 +188,103 @@ async def test_portals_route_each_kind_of_login(owner):
     async with new_client() as stranger:
         me = await login(stranger, rand_phone())
         assert (me["portal"], me["home"]) == (None, "/setup")
+
+
+async def test_batch_members_and_attendance_rate(owner):
+    a = await add_student(owner, "A")
+    b = await add_student(owner, "B")
+    await pay(owner, a["id"], 80000)
+    await pay(owner, b["id"], 30000)
+    from app.core.timeutil import today_local
+
+    await owner.post(
+        f"{V1}/attendance/sync",
+        json={
+            "id": str(uuid.uuid4()),
+            "batch_id": owner.batch_id,
+            "date": today_local().isoformat(),
+            "records": [{"student_id": a["id"], "status": "present"}, {"student_id": b["id"], "status": "absent"}],
+        },
+    )
+    batch = (await owner.get(f"{V1}/batches/{owner.batch_id}")).json()
+    assert batch["month_attendance"] == 50 and batch["last_month_attendance"] is None
+    assert batch["due_students"] == 1 and batch["month_due"] == 50000
+
+    r = await owner.get(f"{V1}/batches/{owner.batch_id}/members")
+    assert r.status_code == 200, r.text
+    rows = {m["name"]: m for m in r.json()}
+    assert (rows["A"]["month_status"], rows["A"]["attendance"]) == ("paid", 100)
+    assert (rows["B"]["month_status"], rows["B"]["month_paid"], rows["B"]["attendance"]) == ("partial", 30000, 0)
+    assert rows["B"]["month_amount"] == 80000 and rows["B"]["outstanding"] == 50000
+
+
+async def test_student_list_extras_and_summary(owner):
+    a = await add_student(owner, "A")
+    b = await add_student(owner, "B")
+    await pay(owner, b["id"], 30000)
+    from app.core.timeutil import today_local
+
+    await owner.post(
+        f"{V1}/attendance/sync",
+        json={
+            "id": str(uuid.uuid4()),
+            "batch_id": owner.batch_id,
+            "date": today_local().isoformat(),
+            "records": [{"student_id": a["id"], "status": "present"}, {"student_id": b["id"], "status": "absent"}],
+        },
+    )
+    page = (await owner.get(f"{V1}/students")).json()
+    rows = {s["name"]: s for s in page["items"]}
+    assert (rows["A"]["partial"], rows["A"]["month_attendance"]) == (False, 100)
+    assert (rows["B"]["partial"], rows["B"]["month_attendance"], rows["B"]["outstanding"]) == (True, 0, 50000)
+
+    await owner.post(f"{V1}/students/{a['id']}/leave", json={})
+    summary = (await owner.get(f"{V1}/students/summary")).json()
+    assert summary == {"active": 1, "joined_this_month": 1, "with_due": 1, "left": 1}
+
+
+async def test_fee_overview_and_receipt_switch(owner):
+    a = await add_student(owner, "A")
+    r = await owner.post(
+        f"{V1}/fees/payments",
+        json={"student_id": a["id"], "amount": 80000, "method": "bkash", "send_receipt": False},
+        headers={"Idempotency-Key": uuid.uuid4().hex},
+    )
+    assert r.status_code == 201 and r.json()["sms_status"] is None
+    ov = (await owner.get(f"{V1}/fees/overview")).json()
+    assert (ov["collected"], ov["billed"], ov["by_method"]) == (80000, 80000, {"bkash": 80000})
+    assert (ov["today_amount"], ov["today_count"], ov["today_receipts"]) == (80000, 1, 0)
+    pays = (await owner.get(f"{V1}/fees/payments")).json()
+    assert pays[0]["batch_names"] == ["SSC A"]
+
+
+async def test_notice_templates_audience_and_scheduled_notice(owner):
+    a = await add_student(owner, "Tania")
+    await owner.post(f"{V1}/students", json={"name": "NoPhone", "enrollments": [{"batch_id": owner.batch_id}]})
+    tpls = (await owner.get(f"{V1}/messages/templates")).json()
+    assert {"n_holiday", "absent"} <= {t["key"] for t in tpls}
+    assert next(t for t in tpls if t["key"] == "absent")["kind"] == "auto"
+
+    made = await owner.post(f"{V1}/messages/templates", json={"name": "সভা", "body_bn": "{student}-এর সভা {date}-এ"})
+    assert made.status_code == 201 and made.json()["kind"] == "notice"
+    assert (await owner.delete(f"{V1}/messages/templates/{made.json()['key']}")).status_code == 204
+    assert (await owner.delete(f"{V1}/messages/templates/absent")).status_code == 409
+
+    aud = (await owner.post(f"{V1}/messages/notice/audience", json={"batch_ids": [owner.batch_id]})).json()
+    assert aud == {"students": 2, "guardians": 1, "missing_phone": 1}
+
+    from datetime import UTC, datetime, timedelta
+
+    later = (datetime.now(UTC) + timedelta(days=2)).isoformat()
+    r = await owner.post(
+        f"{V1}/messages/notice",
+        json={"message": "{student} আসবে, {batch}", "batch_ids": [owner.batch_id], "title": "সভা", "send_at": later},
+    )
+    assert r.json() == {"queued": 1, "recipients": 1}
+    msgs = (await owner.get(f"{V1}/messages", params={"kind": "notice"})).json()
+    assert msgs[0]["body"].startswith("Tania আসবে, SSC A") and msgs[0]["status"] == "held"
+    notices = (await owner.get(f"{V1}/messages/notices")).json()
+    assert notices[0]["title"] == "সভা" and notices[0]["targets"] == ["SSC A"] and notices[0]["pending"] is True
+    ov = (await owner.get(f"{V1}/messages/overview")).json()
+    assert ov["scheduled_notices"] == 1 and ov["counts"]["notice"] == 1
+    assert ov["counts"]["welcome"] == 1 and a["name"] == "Tania"

@@ -35,6 +35,14 @@ DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
     },
 }
 
+# Starter notice templates ("নোটিশের জন্য"). Keys start with "n_"; owners can add, edit and delete them.
+DEFAULT_NOTICE_TEMPLATES: dict[str, dict[str, str]] = {
+    "n_holiday": {"name": "ছুটির নোটিশ", "bn": "{date} পর্যন্ত ক্লাস বন্ধ থাকবে। আবার ক্লাস শুরু হলে জানানো হবে।"},
+    "n_exam": {"name": "পরীক্ষার নোটিশ", "bn": "{date}-এ {batch}-এর মডেল টেস্ট হবে। {student} যেন সময়মতো আসে।"},
+    "n_meeting": {"name": "অভিভাবক সভা", "bn": "{date}-এ {batch}-এর অভিভাবক সভা, অবশ্যই আসবেন।"},
+}
+NOTICE_PREFIX = "n_"
+
 # Receipts are triggered by the guardian's own action, so they skip the daily cap.
 CAP_EXEMPT = {"receipt"}
 PRIORITY = {"receipt": 1, "absent": 3, "welcome": 3, "notice": 4}
