@@ -17,6 +17,8 @@ class PaymentIn(BaseModel):
 class AllocationOut(BaseModel):
     fee_due_id: uuid.UUID
     month: date
+    kind: str = "monthly"  # monthly | admission | course | installment
+    label: str | None = None
     batch_id: uuid.UUID
     amount: int
     due_status: str
@@ -26,7 +28,7 @@ class ReceiptOut(BaseModel):
     payment_id: uuid.UUID
     student_id: uuid.UUID
     student_name: str
-    roll_no: str
+    student_code: str
     amount: int
     method: str
     trx_id: str | None
@@ -59,6 +61,8 @@ class RemindIn(BaseModel):
 class DueOut(BaseModel):
     id: uuid.UUID
     month: date
+    kind: str = "monthly"  # monthly | admission | course | installment
+    label: str | None = None
     batch_id: uuid.UUID
     batch_name: str
     amount: int
@@ -74,7 +78,7 @@ class PaymentOut(BaseModel):
     id: uuid.UUID
     student_id: uuid.UUID
     student_name: str
-    roll_no: str
+    student_code: str
     kind: str
     amount: int
     method: str
@@ -114,7 +118,7 @@ class LedgerOut(BaseModel):
 class DueStudentRow(BaseModel):
     student_id: uuid.UUID
     name: str
-    roll_no: str
+    student_code: str
     guardian_phone: str | None
     batch_names: list[str]
     outstanding: int

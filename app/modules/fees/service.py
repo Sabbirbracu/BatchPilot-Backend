@@ -1,7 +1,8 @@
 """Fees ledger service — the heart of BatchPilot.
 
 Rules (System Design §8):
-- one fee_dues row per enrollment per month; status derived from amount − discount vs paid_amount
+- one monthly fee_dues row per enrollment per month; status derived from amount − discount vs paid_amount
+- one-time dues sit in the same table: admission fee, course fee, or course instalments (kind + label)
 - a payment is allocated to open dues oldest-first; any surplus goes to future months
   (created on demand) so money is never left unallocated
 - payments are never edited or deleted; a mistake is a reversal row with negative allocations
@@ -12,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +21,7 @@ from app.core.config import get_settings
 from app.core.deps import TenantContext
 from app.core.errors import AppError, forbidden, not_found
 from app.core.ids import new_id
-from app.core.money import format_taka, months_label
+from app.core.money import format_taka, month_label
 from app.core.timeutil import add_months, current_month, due_date_for, now_utc, today_local
 from app.modules.academics.models import Batch, Enrollment, Student
 from app.modules.audit import service as audit
@@ -31,6 +32,17 @@ from app.modules.messaging import service as messaging
 
 MAX_ADVANCE_MONTHS = 12
 OPEN = ("due", "partial")
+MONTHLY_ONLY = text("kind = 'monthly'")
+# Oldest first; within a month the admission fee is paid before anything else.
+ALLOCATION_ORDER = (FeeDue.month, case((FeeDue.kind == "admission", 0), else_=1), FeeDue.created_at)
+
+
+def dues_label(dues: list[FeeDue], bangla: bool = True) -> str:
+    """'জানুয়ারি, ফেব্রুয়ারি' for monthly dues, plus the labels of one-time dues ('ভর্তি ফি')."""
+    months = sorted({d.month for d in dues if d.kind == "monthly"})
+    parts = [month_label(m, bangla) for m in months]
+    parts += [d.label or d.kind for d in sorted(dues, key=lambda d: d.month) if d.kind != "monthly"]
+    return ", ".join(dict.fromkeys(parts))
 
 
 def due_status(amount: int, discount: int, paid: int) -> str:
@@ -72,13 +84,55 @@ async def ensure_due(
             status=due_status(amount, 0, 0),
             due_date=due_date_for(month, inst.fee_due_day),
         )
-        .on_conflict_do_nothing(index_elements=["enrollment_id", "month"])
+        .on_conflict_do_nothing(index_elements=["enrollment_id", "month"], index_where=MONTHLY_ONLY)
     )
     return (
         await db.execute(
-            select(FeeDue).where(FeeDue.enrollment_id == enrollment.id, FeeDue.month == month)
+            select(FeeDue).where(FeeDue.enrollment_id == enrollment.id, FeeDue.month == month, FeeDue.kind == "monthly")
         )
     ).scalar_one()
+
+
+async def add_one_time_due(
+    db: AsyncSession,
+    inst: Institution,
+    enrollment: Enrollment,
+    *,
+    kind: str,
+    label: str,
+    amount: int,
+    month: date,
+    due_date: date,
+    discount: int = 0,
+    discount_reason: str | None = None,
+) -> FeeDue | None:
+    """Admission fee, course fee or one instalment. Idempotent per (enrollment, kind, month)."""
+    if amount <= 0:
+        return None
+    discount = min(max(discount, 0), amount)
+    res = await db.execute(
+        insert(FeeDue)
+        .values(
+            id=new_id(),
+            institution_id=inst.id,
+            student_id=enrollment.student_id,
+            enrollment_id=enrollment.id,
+            batch_id=enrollment.batch_id,
+            month=month,
+            kind=kind,
+            label=label,
+            amount=amount,
+            discount=discount,
+            discount_reason=discount_reason if discount else None,
+            paid_amount=0,
+            status=due_status(amount, discount, 0),
+            due_date=due_date,
+        )
+        .on_conflict_do_nothing(index_elements=["enrollment_id", "kind", "month"], index_where=text("kind <> 'monthly'"))
+        .returning(FeeDue.id)
+    )
+    new = res.scalar_one_or_none()
+    return await db.get(FeeDue, new) if new else None
 
 
 # ---------------------------------------------------------------- monthly generation
@@ -105,6 +159,7 @@ async def generate_month(db: AsyncSession, inst: Institution, month: date, actor
                 Student.deleted_at.is_(None),
                 Batch.archived_at.is_(None),
                 Batch.deleted_at.is_(None),
+                Batch.fee_plan == "monthly",
             )
         )
     ).all()
@@ -129,7 +184,10 @@ async def generate_month(db: AsyncSession, inst: Institution, month: date, actor
     created = 0
     if values:
         res = await db.execute(
-            insert(FeeDue).values(values).on_conflict_do_nothing(index_elements=["enrollment_id", "month"]).returning(FeeDue.id)
+            insert(FeeDue)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=["enrollment_id", "month"], index_where=MONTHLY_ONLY)
+            .returning(FeeDue.id)
         )
         created = len(res.all())
     stats = {"enrollments": len(rows), "created": created, "by": str(actor_id) if actor_id else "scheduler"}
@@ -170,7 +228,7 @@ async def _allocations_for(db: AsyncSession, payment_id: uuid.UUID) -> list[tupl
             select(FeeDue, PaymentAllocation.amount)
             .join(PaymentAllocation, PaymentAllocation.fee_due_id == FeeDue.id)
             .where(PaymentAllocation.payment_id == payment_id)
-            .order_by(FeeDue.month)
+            .order_by(*ALLOCATION_ORDER)
         )
     ).all()
     return [(d, a) for d, a in rows]
@@ -190,6 +248,7 @@ async def _future_dues(
                 Enrollment.deleted_at.is_(None),
                 Enrollment.end_month.is_(None),
                 Batch.archived_at.is_(None),
+                Batch.fee_plan == "monthly",
             )
             .order_by(Enrollment.created_at)
         )
@@ -199,7 +258,9 @@ async def _future_dues(
     cm = current_month()
     cursor: dict[uuid.UUID, date] = {}
     for enr, _ in rows:
-        last = await db.scalar(select(func.max(FeeDue.month)).where(FeeDue.enrollment_id == enr.id))
+        last = await db.scalar(
+            select(func.max(FeeDue.month)).where(FeeDue.enrollment_id == enr.id, FeeDue.kind == "monthly")
+        )
         cursor[enr.id] = add_months(last, 1) if last else max(enr.start_month, cm)
 
     out: list[FeeDue] = []
@@ -252,14 +313,14 @@ async def record_payment(
             await db.execute(
                 select(FeeDue)
                 .where(FeeDue.student_id == student.id, FeeDue.status.in_(OPEN))
-                .order_by(FeeDue.month, FeeDue.created_at)
+                .order_by(*ALLOCATION_ORDER)
                 .with_for_update()
             )
         ).scalars()
     )
     if due_ids:
         wanted = set(due_ids)
-        open_dues.sort(key=lambda d: (d.id not in wanted, d.month))
+        open_dues.sort(key=lambda d: (d.id not in wanted, d.month, d.kind != "admission"))
 
     remaining = amount
     plan: list[tuple[FeeDue, int]] = []
@@ -321,7 +382,7 @@ async def record_payment(
             values={
                 "student": student.name,
                 "amount": format_taka(amount),
-                "months": months_label([d.month for d, _ in plan]),
+                "months": dues_label([d for d, _ in plan]),
                 "institution": inst.name,
             },
         )
@@ -464,14 +525,14 @@ async def send_reminders(
             .order_by(FeeDue.month)
         )
     ).all()
-    per_student: dict[uuid.UUID, tuple[Student, int, list[date]]] = {}
+    per_student: dict[uuid.UUID, tuple[Student, int, list[FeeDue]]] = {}
     for d, s in rows:
-        _, total, months = per_student.get(s.id, (s, 0, []))
-        per_student[s.id] = (s, total + outstanding_of(d), months + [d.month])
+        _, total, dues = per_student.get(s.id, (s, 0, []))
+        per_student[s.id] = (s, total + outstanding_of(d), dues + [d])
 
     today = today_local().isoformat()
     queued = skipped = 0
-    for sid, (s, total, months) in per_student.items():
+    for sid, (s, total, dues) in per_student.items():
         msg = await messaging.enqueue(
             db,
             institution_id=inst.id,
@@ -482,10 +543,10 @@ async def send_reminders(
             values={
                 "student": s.name,
                 "amount": format_taka(total),
-                "months": months_label(months),
+                "months": dues_label(dues),
                 "institution": inst.name,
                 "bkash": inst.settings.get("bkash_number") or "",
-                "roll": s.roll_no,
+                "student_id": s.student_code,
             },
         )
         if msg:

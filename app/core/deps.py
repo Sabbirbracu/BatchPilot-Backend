@@ -85,6 +85,17 @@ async def get_auth(request: Request, db: DB) -> AuthContext:
 Auth = Annotated[AuthContext, Depends(get_auth)]
 
 
+async def get_optional_auth(request: Request, db: DB) -> AuthContext | None:
+    """Public pages that show a little more to a logged-in visitor."""
+    try:
+        return await get_auth(request, db)
+    except AppError:
+        return None
+
+
+MaybeAuth = Annotated[AuthContext | None, Depends(get_optional_auth)]
+
+
 async def get_tenant(auth: Auth) -> TenantContext:
     inst_id = auth.session.active_institution_id
     if not inst_id:

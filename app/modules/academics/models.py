@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     Time,
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.db import Base, IdMixin, SoftDeleteMixin, TimestampMixin
 
 WEEKDAYS = ("sat", "sun", "mon", "tue", "wed", "thu", "fri")
+FEE_PLANS = ("monthly", "course")  # course = one fee for the whole course, paid at once or in instalments
 
 
 class Batch(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -36,6 +38,11 @@ class Batch(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
     monthly_fee: Mapped[int] = mapped_column(BigInteger, nullable=False)  # poisha
     admission_fee: Mapped[int | None] = mapped_column(BigInteger)  # poisha
     capacity: Mapped[int | None] = mapped_column(Integer)
+    fee_plan: Mapped[str] = mapped_column(String(10), default="monthly", server_default="monthly", nullable=False)
+    course_fee: Mapped[int | None] = mapped_column(BigInteger)  # poisha; fee_plan == "course"
+    installments: Mapped[int] = mapped_column(SmallInteger, default=1, server_default="1", nullable=False)
+    location: Mapped[str | None] = mapped_column(String(160))  # shown on admission pages
+    starts_on: Mapped[date | None] = mapped_column(Date)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -46,9 +53,9 @@ class Student(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
         Index("ix_students_inst_status", "institution_id", "status"),
         Index("ix_students_inst_guardian_phone", "institution_id", "guardian_phone"),
         Index(
-            "uq_students_inst_roll",
+            "uq_students_inst_code",
             "institution_id",
-            "roll_no",
+            "student_code",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),
         ),
@@ -56,10 +63,11 @@ class Student(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
 
     institution_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("institutions.id"), nullable=False)
-    roll_no: Mapped[str] = mapped_column(String(30), nullable=False)
+    student_code: Mapped[str] = mapped_column(String(30), nullable=False)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(20))
     guardian_name: Mapped[str | None] = mapped_column(String(120))
+    guardian_relation: Mapped[str | None] = mapped_column(String(10))  # father | mother | other
     guardian_phone: Mapped[str | None] = mapped_column(String(20))
     guardian_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     school: Mapped[str | None] = mapped_column(String(160))

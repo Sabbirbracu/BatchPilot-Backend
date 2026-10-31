@@ -74,7 +74,7 @@ class Institution(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
     plan: Mapped[str] = mapped_column(String(20), default="pro", nullable=False)
     plan_status: Mapped[str] = mapped_column(String(20), default="beta", nullable=False)
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    next_roll: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    next_student_code: Mapped[int] = mapped_column(Integer, default=100001, nullable=False)  # six-digit student IDs
     settings: Mapped[dict] = mapped_column(JSONB, default=lambda: dict(DEFAULT_SETTINGS), nullable=False)
 
 

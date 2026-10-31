@@ -5,9 +5,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import TenantContext
 from app.core.errors import AppError, not_found
+from app.core.money import BN_DIGITS
 from app.core.phone import normalize_optional
 from app.core.security import new_qr_token
-from app.core.timeutil import add_months, current_month, today_local
+from app.core.timeutil import add_months, current_month, due_date_for, today_local
 from app.modules.academics.models import Batch, Enrollment, Student
 from app.modules.academics.schemas import EnrollmentIn, EnrollmentOut, StudentIn, StudentOut
 from app.modules.attendance.models import AttendanceRecord
@@ -17,7 +18,7 @@ from app.modules.fees.models import FeeDue
 from app.modules.identity.models import Institution
 from app.modules.messaging import service as messaging
 
-STUDENT_FIELDS = ["name", "phone", "guardian_name", "guardian_phone", "school", "class_level", "note", "status"]
+STUDENT_FIELDS = ["name", "phone", "guardian_name", "guardian_relation", "guardian_phone", "school", "class_level", "note", "status"]
 
 
 async def get_batch(db: AsyncSession, batch_id: uuid.UUID) -> Batch:
@@ -34,22 +35,35 @@ async def get_student(db: AsyncSession, student_id: uuid.UUID) -> Student:
     return s
 
 
-async def _next_roll(db: AsyncSession, inst: Institution) -> str:
+async def _next_student_code(db: AsyncSession, inst: Institution) -> str:
+    """Next free six-digit student ID (100001, 100002, …): numeric with no leading zero, so it fits RFID cards and fingerprint machines."""
     while True:
         n = (
             await db.execute(
                 update(Institution)
                 .where(Institution.id == inst.id)
-                .values(next_roll=Institution.next_roll + 1)
-                .returning(Institution.next_roll - 1)
+                .values(next_student_code=Institution.next_student_code + 1)
+                .returning(Institution.next_student_code - 1)
             )
         ).scalar_one()
-        roll = str(n)
+        code = str(n)
         taken = await db.scalar(
-            select(func.count()).select_from(Student).where(Student.roll_no == roll, Student.deleted_at.is_(None))
+            select(func.count()).select_from(Student).where(Student.student_code == code, Student.deleted_at.is_(None))
         )
         if not taken:
-            return roll
+            return code
+
+
+def check_fee_overrides(t: TenantContext, enrollments: list[EnrollmentIn]) -> None:
+    """Special fees and discounts are the owner's call; assistants admit at the standard fee."""
+    if t.can("due.discount"):
+        return
+    for e in enrollments:
+        if e.custom_fee is not None or e.admission_discount or e.fee_discount:
+            raise AppError(
+                "forbidden", "Only the owner can set a special fee or discount",
+                "বিশেষ ফি বা ছাড় শুধু মালিক দিতে পারবেন", 403, "custom_fee",
+            )
 
 
 async def enroll(
@@ -69,7 +83,12 @@ async def enroll(
     if already:
         raise AppError("already_enrolled", "Already in this batch", "এই ব্যাচে আগেই আছে", 409, "batch_id")
     cm = current_month()
-    start = (data.start_month or cm).replace(day=1)
+    if data.start_month:
+        start = data.start_month.replace(day=1)
+    elif batch.starts_on and batch.starts_on.replace(day=1) > cm:
+        start = batch.starts_on.replace(day=1)  # admitted early for a batch that starts later
+    else:
+        start = cm
     enr = Enrollment(
         institution_id=inst.id,
         student_id=student.id,
@@ -80,18 +99,57 @@ async def enroll(
     )
     db.add(enr)
     await db.flush()
+    today = today_local()
+    reason = (data.discount_note or "").strip() or "ভর্তির ছাড়"
+    if data.admission_fee:  # due today, even when classes start later
+        await fees.add_one_time_due(
+            db, inst, enr, kind="admission", label="ভর্তি ফি", amount=data.admission_fee, month=min(start, cm),
+            due_date=today, discount=data.admission_discount, discount_reason=reason,
+        )
+    if batch.fee_plan == "course":
+        await _course_dues(db, inst, enr, batch, start, data.fee_discount, reason)
+        return enr
     # Dues from the start month up to now (a back-dated start creates arrears, capped at a year).
+    # A later start gets its first month now, so it can be paid in advance at admission.
     month = max(start, add_months(cm, -11))
-    while month <= cm:
-        await fees.ensure_due(db, inst, enr, batch, month)
+    while month <= max(start, cm):
+        due = await fees.ensure_due(db, inst, enr, batch, month)
+        if month == start and data.fee_discount and due.paid_amount == 0:
+            due.discount = min(data.fee_discount, due.amount)
+            due.discount_reason = reason
+            due.status = fees.due_status(due.amount, due.discount, due.paid_amount)
         month = add_months(month, 1)
     return enr
 
 
-async def create_student(t: TenantContext, data: StudentIn) -> Student:
+async def _course_dues(
+    db: AsyncSession, inst: Institution, enr: Enrollment, batch: Batch, start, discount: int, reason: str
+) -> None:
+    """A course fee is one due, or N monthly instalments (the last one takes the rounding).
+    A discount comes off the first instalment and spills into the next ones if bigger."""
+    total = enr.custom_fee if enr.custom_fee is not None else (batch.course_fee or 0)
+    n = max(batch.installments, 1)
+    base = (total // n // 100) * 100  # whole taka per instalment
+    for i in range(n):
+        amount = total - base * (n - 1) if i == n - 1 else base
+        off = min(discount, amount)
+        discount -= off
+        month = min(start, current_month()) if i == 0 else add_months(start, i)  # first one is due now
+        await fees.add_one_time_due(
+            db, inst, enr,
+            kind="course" if n == 1 else "installment",
+            label="কোর্স ফি" if n == 1 else f"কিস্তি {i + 1}/{n}".translate(BN_DIGITS),
+            amount=amount, month=month,
+            due_date=today_local() if i == 0 else due_date_for(month, inst.fee_due_day),
+            discount=off, discount_reason=reason,
+        )
+
+
+async def create_student(t: TenantContext, data: StudentIn, *, welcome: bool = True, checked: bool = False) -> Student:
+    """`checked`: the caller already validated fee overrides (e.g. an admission QR offer)."""
     t.require("student.manage")
-    if any(e.custom_fee is not None for e in data.enrollments) and not t.can("due.discount"):
-        raise AppError("forbidden", "Only the owner can set a special fee", "বিশেষ ফি শুধু মালিক দিতে পারবেন", 403, "custom_fee")
+    if not checked:
+        check_fee_overrides(t, data.enrollments)
     db, inst = t.db, t.institution
     phone = normalize_optional(data.phone, "phone")
     guardian_phone = normalize_optional(data.guardian_phone, "guardian_phone")
@@ -111,25 +169,26 @@ async def create_student(t: TenantContext, data: StudentIn) -> Student:
             if dup:
                 raise AppError(
                     "possible_duplicate",
-                    f"A student with this name and phone already exists (roll {dup.roll_no})",
-                    f"এই নাম ও নম্বরে একজন স্টুডেন্ট আগেই আছে (রোল {dup.roll_no})",
+                    f"A student with this name and phone already exists (ID {dup.student_code})",
+                    f"এই নাম ও নম্বরে একজন স্টুডেন্ট আগেই আছে (আইডি {dup.student_code})",
                     409,
                 )
 
-    roll = (data.roll_no or "").strip()
-    if roll:
-        taken = await db.scalar(select(Student.id).where(Student.roll_no == roll, Student.deleted_at.is_(None)))
+    code = (data.student_code or "").strip()
+    if code:
+        taken = await db.scalar(select(Student.id).where(Student.student_code == code, Student.deleted_at.is_(None)))
         if taken:
-            raise AppError("roll_taken", "This roll number is taken", "এই রোল নম্বর আগেই আছে", 409, "roll_no")
+            raise AppError("student_code_taken", "This student ID is taken", "এই স্টুডেন্ট আইডি আগেই আছে", 409, "student_code")
     else:
-        roll = await _next_roll(db, inst)
+        code = await _next_student_code(db, inst)
 
     st = Student(
         institution_id=inst.id,
-        roll_no=roll,
+        student_code=code,
         name=data.name.strip(),
         phone=phone,
         guardian_name=(data.guardian_name or "").strip() or None,
+        guardian_relation=data.guardian_relation,
         guardian_phone=guardian_phone,
         school=data.school,
         class_level=data.class_level,
@@ -142,7 +201,7 @@ async def create_student(t: TenantContext, data: StudentIn) -> Student:
     for e in data.enrollments:
         await enroll(db, inst, st, e)
 
-    if guardian_phone:
+    if guardian_phone and welcome:
         await messaging.enqueue(
             db,
             institution_id=inst.id,
@@ -159,7 +218,7 @@ async def create_student(t: TenantContext, data: StudentIn) -> Student:
         action="student.created",
         entity="student",
         entity_id=st.id,
-        after={**audit.snapshot(st, STUDENT_FIELDS), "roll_no": roll, "batches": [e.batch_id for e in data.enrollments]},
+        after={**audit.snapshot(st, STUDENT_FIELDS), "student_code": code, "batches": [e.batch_id for e in data.enrollments]},
         ip=t.ip,
     )
     await db.flush()
@@ -257,7 +316,7 @@ async def search_students(
         term = q.strip()
         like = f"%{term}%"
         digits = "".join(ch for ch in term if ch.isdigit())
-        ors = [Student.name.ilike(like), Student.roll_no == term, Student.guardian_name.ilike(like)]
+        ors = [Student.name.ilike(like), Student.student_code == term, Student.guardian_name.ilike(like)]
         if len(digits) >= 4:
             ors += [Student.phone.like(f"%{digits[-10:]}%"), Student.guardian_phone.like(f"%{digits[-10:]}%")]
         conds.append(or_(*ors))

@@ -14,8 +14,8 @@ DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
         "en": "Dear guardian, Tk {amount} fee for {student} ({months}) is due. Please pay. — {institution}",
     },
     "reminder_2": {
-        "bn": "{student}-এর ফি ৳{amount} এখনো বাকি। বিকাশ: {bkash}, রেফারেন্সে রোল {roll} লিখুন। — {institution}",
-        "en": "Tk {amount} fee for {student} is still due. bKash: {bkash}, reference roll {roll}. — {institution}",
+        "bn": "{student}-এর ফি ৳{amount} এখনো বাকি। বিকাশ: {bkash}, রেফারেন্সে আইডি {student_id} লিখুন। — {institution}",
+        "en": "Tk {amount} fee for {student} is still due. bKash: {bkash}, reference ID {student_id}. — {institution}",
     },
     "reminder_3": {
         "bn": "{student}-এর ফি ৳{amount} ({months}) বাকি। অফিসে যোগাযোগ করুন। — {institution}",
@@ -24,6 +24,14 @@ DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
     "welcome": {
         "bn": "{student}-কে {institution}-এ স্বাগতম। উপস্থিতি ও ফির খবর এই নম্বরে পাবেন।",
         "en": "Welcome {student} to {institution}. Attendance and fee updates will come to this number.",
+    },
+    "admission_request": {
+        "bn": "{student}-এর ভর্তির আবেদন পেয়েছি ({batch})। {hold} তারিখের মধ্যে ফি দিলে সিট নিশ্চিত হবে। — {institution}",
+        "en": "Got {student}'s admission request ({batch}). Pay by {hold} to confirm the seat. — {institution}",
+    },
+    "admitted": {
+        "bn": "{student}-এর ভর্তি সম্পন্ন: {batch}, আইডি {student_id}। বাকি ৳{due}। হাজিরা ও ফির খবর এই নম্বরে পাবেন। — {institution}",
+        "en": "{student} is admitted to {batch}, ID {student_id}. Due Tk {due}. Updates come to this number. — {institution}",
     },
     "notice": {
         "bn": "{message} — {institution}",
@@ -45,7 +53,7 @@ NOTICE_PREFIX = "n_"
 
 # Receipts are triggered by the guardian's own action, so they skip the daily cap.
 CAP_EXEMPT = {"receipt"}
-PRIORITY = {"receipt": 1, "absent": 3, "welcome": 3, "notice": 4}
+PRIORITY = {"receipt": 1, "admitted": 2, "admission_request": 2, "absent": 3, "welcome": 3, "notice": 4}
 
 
 class _SafeDict(dict):

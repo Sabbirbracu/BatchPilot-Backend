@@ -18,7 +18,7 @@ from app.core.ids import new_id
 from app.core.phone import normalize_bd_phone
 from app.core.timeutil import DHAKA, add_months, current_month, today_local
 from app.modules.academics.models import Batch, Enrollment, Student
-from app.modules.academics.service import _next_roll
+from app.modules.academics.service import _next_student_code
 from app.modules.attendance.models import AttendanceRecord, AttendanceSession
 from app.modules.attendance.service import weekday_code
 from app.modules.fees import service as fees
@@ -103,7 +103,7 @@ async def main() -> None:
             for _ in range(n):
                 name = f"{random.choice(FIRST)} {random.choice(LAST)}"
                 st = Student(
-                    institution_id=inst_id, roll_no=await _next_roll(db, inst), name=name,
+                    institution_id=inst_id, student_code=await _next_student_code(db, inst), name=name,
                     phone=phone() if random.random() < 0.5 else None,
                     guardian_name=f"{random.choice(GUARDIAN_FIRST)} {name.split()[1]}",
                     guardian_phone=phone(), school=random.choice(SCHOOLS), class_level=batch.class_level,

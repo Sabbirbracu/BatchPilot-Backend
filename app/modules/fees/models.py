@@ -12,7 +12,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
-    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -21,12 +20,18 @@ from app.core.db import Base, IdMixin, TimestampMixin
 
 PAYMENT_METHODS = ("cash", "bkash", "nagad", "bank")
 DUE_STATUSES = ("due", "partial", "paid", "waived")
+# monthly: one per enrollment per month. admission: one-time on joining. course / installment: course-fee batches.
+DUE_KINDS = ("monthly", "admission", "course", "installment")
 
 
 class FeeDue(IdMixin, TimestampMixin, Base):
     __tablename__ = "fee_dues"
     __table_args__ = (
-        UniqueConstraint("enrollment_id", "month"),
+        # One monthly due per enrollment per month; other kinds are keyed by (kind, month) as well.
+        Index("uq_fee_dues_monthly", "enrollment_id", "month", unique=True, postgresql_where=text("kind = 'monthly'")),
+        Index(
+            "uq_fee_dues_other", "enrollment_id", "kind", "month", unique=True, postgresql_where=text("kind <> 'monthly'")
+        ),
         Index("ix_fee_dues_student_month", "student_id", "month"),
         Index(
             "ix_fee_dues_open",
@@ -45,6 +50,8 @@ class FeeDue(IdMixin, TimestampMixin, Base):
     enrollment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("enrollments.id"), nullable=False)
     batch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("batches.id"), index=True, nullable=False)
     month: Mapped[date] = mapped_column(Date, nullable=False)  # first day of month
+    kind: Mapped[str] = mapped_column(String(12), default="monthly", server_default="monthly", nullable=False)
+    label: Mapped[str | None] = mapped_column(String(60))  # shown instead of the month for non-monthly dues
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     discount: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     discount_reason: Mapped[str | None] = mapped_column(String(200))

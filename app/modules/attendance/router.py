@@ -106,7 +106,7 @@ async def roster(batch_id: uuid.UUID, t: Tenant, day: date | None = Query(defaul
         RosterItem(
             student_id=s.id,
             name=s.name,
-            roll_no=s.roll_no,
+            student_code=s.student_code,
             status=stored.get(s.id, "present"),
             guardian_phone=s.guardian_phone,
             due_months=dues.get(s.id, 0),

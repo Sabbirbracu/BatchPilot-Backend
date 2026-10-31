@@ -12,6 +12,7 @@ from app.core.permissions import permissions_for
 from app.core.security import hash_otp, hash_token, new_otp_code, new_session_token
 from app.core.timeutil import now_utc
 from app.modules.academics.models import Student
+from app.modules.admissions.models import AdmissionRequest
 from app.modules.audit import service as audit
 from app.modules.identity.models import PORTAL_BY_ROLE, Institution, Membership, OtpRequest, Session, User
 from app.modules.identity.schemas import (
@@ -132,7 +133,20 @@ async def pick_portal(db: AsyncSession, user: User) -> tuple[uuid.UUID | None, s
         hit = next((inst for inst, _, k in links if k == kind), None)
         if hit:
             return hit, kind
+    applied = await _applied_institution(user)
+    if applied:  # sent a join request from a QR page and is waiting for the teacher
+        return applied, "guardian"
     return None, None  # new teacher: goes to the setup wizard
+
+
+async def _applied_institution(user: User) -> uuid.UUID | None:
+    async with OpsSessionLocal() as ops:
+        return await ops.scalar(
+            select(AdmissionRequest.institution_id)
+            .where(AdmissionRequest.user_id == user.id)
+            .order_by(AdmissionRequest.created_at.desc())
+            .limit(1)
+        )
 
 
 async def create_session(

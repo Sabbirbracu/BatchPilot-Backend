@@ -20,7 +20,7 @@ class SyncIn(BaseModel):
 class RosterItem(BaseModel):
     student_id: uuid.UUID
     name: str
-    roll_no: str
+    student_code: str
     status: str  # stored status, or 'present' by default when not taken yet
     guardian_phone: str | None
     due_months: int

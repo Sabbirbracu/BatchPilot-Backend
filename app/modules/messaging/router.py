@@ -27,7 +27,7 @@ KINDS = {
     "receipt": ("receipt",),
     "reminder": ("reminder_1", "reminder_2", "reminder_3"),
     "notice": ("notice",),
-    "welcome": ("welcome",),
+    "welcome": ("welcome", "admitted", "admission_request"),
 }
 QUEUED = ("queued", "held", "sending")
 REACHED = ("sent", "delivered")

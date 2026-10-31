@@ -1,6 +1,7 @@
 """Imports every module's models so Alembic and SQLAlchemy see the full schema."""
 
 from app.modules.academics.models import Batch, Enrollment, Student  # noqa: F401
+from app.modules.admissions.models import AdmissionLink, AdmissionRequest  # noqa: F401
 from app.modules.attendance.models import AttendanceRecord, AttendanceSession  # noqa: F401
 from app.modules.audit.models import AuditLog  # noqa: F401
 from app.modules.automation.models import AutomationRun  # noqa: F401

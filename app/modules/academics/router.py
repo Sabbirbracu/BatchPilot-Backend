@@ -29,7 +29,11 @@ from app.modules.fees.models import FeeDue
 
 router = APIRouter(tags=["academics"])
 
-BATCH_FIELDS = ["name", "subject", "class_level", "days", "start_time", "end_time", "monthly_fee", "admission_fee", "capacity"]
+BATCH_FIELDS = [
+    "name", "subject", "class_level", "days", "start_time", "end_time", "monthly_fee", "admission_fee", "capacity",
+    "fee_plan", "course_fee", "installments", "location", "starts_on",
+]
+NULLABLE_BATCH_FIELDS = ("subject", "class_level", "start_time", "end_time", "admission_fee", "capacity", "course_fee", "location", "starts_on")
 
 
 async def _batch_stats(t: Tenant, batch_ids: list[uuid.UUID]) -> dict[uuid.UUID, dict]:
@@ -141,7 +145,7 @@ async def get_batch(batch_id: uuid.UUID, t: Tenant):
 
 @router.get("/batches/{batch_id}/members", response_model=list[BatchMemberOut])
 async def batch_members(batch_id: uuid.UUID, t: Tenant):
-    """Active students of a batch, in roll order, with this month's fee and attendance in this batch."""
+    """Active students of a batch, in student ID order, with this month's fee and attendance in this batch."""
     db, cm = t.db, current_month()
     await service.get_batch(db, batch_id)
     dues = service.outstanding_subquery()
@@ -181,12 +185,12 @@ async def batch_members(batch_id: uuid.UUID, t: Tenant):
                 Student.status == "active",
                 Student.deleted_at.is_(None),
             )
-            .order_by(func.length(Student.roll_no), Student.roll_no)
+            .order_by(func.length(Student.student_code), Student.student_code)
         )
     ).all()
     return [
         BatchMemberOut(
-            student_id=s.id, roll_no=s.roll_no, name=s.name, guardian_phone=s.guardian_phone,
+            student_id=s.id, student_code=s.student_code, name=s.name, guardian_phone=s.guardian_phone,
             month_amount=int(amount or 0), month_paid=int(paid or 0), month_status=status,
             outstanding=int(outstanding or 0), attendance=rate,
         )
@@ -203,8 +207,10 @@ async def update_batch(batch_id: uuid.UUID, body: BatchUpdate, t: Tenant):
                        "অন্য কেউ এই ব্যাচ বদলেছে। রিলোড করে আবার চেষ্টা করুন।", 409)
     before = audit.snapshot(b, BATCH_FIELDS)
     for k, v in body.model_dump(exclude_unset=True, exclude={"version"}).items():
-        if v is not None or k in ("subject", "class_level", "start_time", "end_time", "admission_fee", "capacity"):
+        if v is not None or k in NULLABLE_BATCH_FIELDS:
             setattr(b, k, v)
+    if b.fee_plan == "course" and not b.course_fee:
+        raise AppError("course_fee_required", "Enter the course fee", "কোর্স ফি লিখুন", 422, "course_fee")
     b.version += 1
     await audit.record(
         t.db, institution_id=t.institution_id, actor_id=t.user.id, action="batch.updated",
@@ -355,8 +361,7 @@ async def list_enrollments(student_id: uuid.UUID, t: Tenant, include_ended: bool
 @router.post("/students/{student_id}/enrollments", response_model=list[EnrollmentOut], status_code=201)
 async def add_enrollment(student_id: uuid.UUID, body: EnrollmentIn, t: Tenant):
     t.require("student.manage")
-    if body.custom_fee is not None and not t.can("due.discount"):
-        raise AppError("forbidden", "Only the owner can set a special fee", "বিশেষ ফি শুধু মালিক দিতে পারবেন", 403, "custom_fee")
+    service.check_fee_overrides(t, [body])
     st = await service.get_student(t.db, student_id)
     if st.status != "active":
         raise AppError("student_left", "This student has left", "এই স্টুডেন্ট ছেড়ে দিয়েছে", 409)

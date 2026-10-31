@@ -4,24 +4,30 @@ Live queries for now; a precomputed daily_stats table replaces the heavy parts o
 teacher dashboard when an institution's history grows (System Design §17)."""
 
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import aliased
 
-from app.core.deps import Family, FamilyContext, Tenant
+from app.core.db import OpsSessionLocal, set_context
+from app.core.deps import Auth, Family, FamilyContext, Tenant
 from app.core.errors import forbidden
-from app.core.timeutil import add_months, current_month, local_day_bounds_utc, today_local
+from app.core.timeutil import add_months, current_month, local_day_bounds_utc, now_utc, today_local
 from app.modules.academics.models import Batch, Enrollment, Student
+from app.modules.admissions import service as admissions
+from app.modules.admissions.models import AdmissionRequest
+from app.modules.admissions.schemas import RequestOut
 from app.modules.attendance.models import AttendanceRecord, AttendanceSession
 from app.modules.attendance.router import today_batches
 from app.modules.attendance.schemas import TodayBatch
 from app.modules.fees.models import FeeDue, Payment
 from app.modules.fees.router import list_dues, my_cash
 from app.modules.fees.schemas import CashSummary, DueStudentRow
-from app.modules.identity.models import User
+from app.modules.identity.models import Institution, Membership, User
+from app.modules.identity.service import family_links
+from app.modules.messaging.models import OutboxMessage
 
 router = APIRouter(prefix="/dashboard", tags=["dashboards"])
 
@@ -39,7 +45,7 @@ class BatchMoney(BaseModel):
 class TopDue(BaseModel):
     student_id: uuid.UUID
     name: str
-    roll_no: str
+    student_code: str
     outstanding: int
     months: int
 
@@ -58,7 +64,7 @@ class TodayClass(TodayBatch):
 class LiveMark(BaseModel):
     student_id: uuid.UUID
     name: str
-    roll_no: str
+    student_code: str
     batch_name: str
     status: str
     at: datetime
@@ -170,9 +176,9 @@ async def teacher_dashboard(t: Tenant):
     ]
 
     top = [
-        TopDue(student_id=sid, name=name, roll_no=roll, outstanding=int(o), months=int(m))
-        for sid, name, roll, o, m in await db.execute(
-            select(Student.id, Student.name, Student.roll_no, per_student.c.outstanding, per_student.c.months)
+        TopDue(student_id=sid, name=name, student_code=code, outstanding=int(o), months=int(m))
+        for sid, name, code, o, m in await db.execute(
+            select(Student.id, Student.name, Student.student_code, per_student.c.outstanding, per_student.c.months)
             .join(per_student, per_student.c.student_id == Student.id)
             .order_by(per_student.c.outstanding.desc())
             .limit(10)
@@ -213,7 +219,7 @@ async def teacher_dashboard(t: Tenant):
         .join(AttendanceRecord, AttendanceRecord.session_id == AttendanceSession.id)
         .join(Student, Student.id == AttendanceRecord.student_id)
         .where(AttendanceSession.date == today, AttendanceRecord.status == "absent")
-        .order_by(Student.roll_no)
+        .order_by(Student.student_code)
     ):
         absent_names.setdefault(bid, []).append(name)
     today_classes = [
@@ -224,15 +230,15 @@ async def teacher_dashboard(t: Tenant):
 
     marked_at = func.coalesce(AttendanceRecord.scanned_at, AttendanceRecord.created_at)
     live = [
-        LiveMark(student_id=sid, name=name, roll_no=roll, batch_name=bname, status=st, at=at)
-        for sid, name, roll, bname, st, at in await db.execute(
-            select(Student.id, Student.name, Student.roll_no, Batch.name, AttendanceRecord.status, marked_at)
+        LiveMark(student_id=sid, name=name, student_code=code, batch_name=bname, status=st, at=at)
+        for sid, name, code, bname, st, at in await db.execute(
+            select(Student.id, Student.name, Student.student_code, Batch.name, AttendanceRecord.status, marked_at)
             .join(Student, Student.id == AttendanceRecord.student_id)
             .join(AttendanceSession, AttendanceSession.id == AttendanceRecord.session_id)
             .join(Batch, Batch.id == AttendanceSession.batch_id)
             .where(AttendanceRecord.date == today)
             # Absences and late arrivals first: those are what the owner acts on.
-            .order_by((AttendanceRecord.status == "present").asc(), marked_at.desc(), Student.roll_no)
+            .order_by((AttendanceRecord.status == "present").asc(), marked_at.desc(), Student.student_code)
             .limit(6)
         )
     ]
@@ -309,6 +315,8 @@ async def staff_dashboard(t: Tenant):
 
 class ChildDue(BaseModel):
     month: date
+    kind: str = "monthly"
+    label: str | None = None
     batch_name: str
     outstanding: int
     status: str
@@ -327,11 +335,27 @@ class ChildPayment(BaseModel):
     reversed: bool
 
 
+class ChildBatch(BaseModel):
+    name: str
+    days: list[str]
+    start_time: time | None
+    end_time: time | None
+    location: str | None
+
+
+class ChildNotice(BaseModel):
+    body: str
+    created_at: datetime
+
+
 class ChildSummary(BaseModel):
     student_id: uuid.UUID
     name: str
-    roll_no: str
+    student_code: str
+    class_level: str | None = None
     batch_names: list[str]
+    batches: list[ChildBatch] = []
+    notices: list[ChildNotice] = []
     outstanding: int
     open_dues: list[ChildDue]
     attendance_rate: float | None
@@ -349,17 +373,35 @@ class FamilyDashboard(BaseModel):
 
 async def _child_summary(db, student: Student) -> ChildSummary:
     cm = current_month()
-    batch_names = list(
+    batches = list(
         (
             await db.execute(
-                select(Batch.name)
+                select(Batch)
                 .join(Enrollment, Enrollment.batch_id == Batch.id)
                 .where(Enrollment.student_id == student.id, Enrollment.end_month.is_(None), Enrollment.deleted_at.is_(None))
+                .order_by(Batch.start_time.nulls_last())
             )
         ).scalars()
     )
+    batch_names = [b.name for b in batches]
+    notices = [
+        ChildNotice(body=body, created_at=at)
+        for body, at in await db.execute(
+            select(OutboxMessage.body, OutboxMessage.created_at)
+            .where(
+                OutboxMessage.student_id == student.id,
+                OutboxMessage.template_key == "notice",
+                OutboxMessage.status != "cancelled",
+            )
+            .order_by(OutboxMessage.created_at.desc())
+            .limit(5)
+        )
+    ]
     dues = [
-        ChildDue(month=d.month, batch_name=bname, outstanding=d.amount - d.discount - d.paid_amount, status=d.status)
+        ChildDue(
+            month=d.month, kind=d.kind, label=d.label, batch_name=bname,
+            outstanding=d.amount - d.discount - d.paid_amount, status=d.status,
+        )
         for d, bname in await db.execute(
             select(FeeDue, Batch.name)
             .join(Batch, Batch.id == FeeDue.batch_id)
@@ -403,8 +445,14 @@ async def _child_summary(db, student: Student) -> ChildSummary:
     return ChildSummary(
         student_id=student.id,
         name=student.name,
-        roll_no=student.roll_no,
+        student_code=student.student_code,
+        class_level=student.class_level,
         batch_names=batch_names,
+        batches=[
+            ChildBatch(name=b.name, days=b.days, start_time=b.start_time, end_time=b.end_time, location=b.location)
+            for b in batches
+        ],
+        notices=notices,
         outstanding=sum(d.outstanding for d in dues),
         open_dues=dues,
         attendance_rate=round(present * 100 / (present + absent), 1) if present + absent else None,
@@ -436,3 +484,76 @@ async def student_dashboard(f: Family):
     if f.kind != "student":
         raise forbidden()
     return await _family_dashboard(f)
+
+
+class FamilyPlace(BaseModel):
+    """One teacher (institution) the family is connected to."""
+
+    institution_id: uuid.UUID
+    institution_name: str
+    teacher_name: str | None
+    bkash_number: str | None
+    children: list[ChildSummary]
+    requests: list[RequestOut]
+
+
+class FamilyOverview(BaseModel):
+    places: list[FamilyPlace]
+
+
+async def _request_places(user_id: uuid.UUID, phone: str) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """Join requests sent by this login or for this guardian number, in any institution (ids only)."""
+    since = now_utc() - timedelta(days=60)
+    async with OpsSessionLocal() as ops:
+        rows = (
+            await ops.execute(
+                select(AdmissionRequest.institution_id, AdmissionRequest.id)
+                .where(
+                    (AdmissionRequest.user_id == user_id) | (AdmissionRequest.guardian_phone == phone),
+                    AdmissionRequest.status != "admitted",
+                    AdmissionRequest.created_at > since,
+                )
+                .order_by(AdmissionRequest.created_at.desc())
+            )
+        ).all()
+    out: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for inst, rid in rows:
+        out.setdefault(inst, []).append(rid)
+    return out
+
+
+@router.get("/family", response_model=FamilyOverview)
+async def family_dashboard(auth: Auth):
+    """Student and guardian share one view: every child linked to this phone, at every teacher,
+    plus join requests still waiting. Each institution is read under its own RLS context."""
+    db, phone = auth.db, auth.user.phone
+    students: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for inst_id, sid, _ in await family_links(phone):
+        students.setdefault(inst_id, []).append(sid)
+    requests = await _request_places(auth.user.id, phone)
+    places = []
+    for inst_id in list(dict.fromkeys([*students, *requests])):
+        await set_context(db, institution_id=inst_id)
+        inst = await db.get(Institution, inst_id)
+        if not inst or inst.deleted_at:
+            continue
+        owner = await db.scalar(
+            select(User.name)
+            .join(Membership, Membership.user_id == User.id)
+            .where(Membership.institution_id == inst_id, Membership.role == "owner")
+            .limit(1)
+        )
+        await admissions.expire_stale(db)
+        kids = [await db.get(Student, sid) for sid in dict.fromkeys(students.get(inst_id, []))]
+        reqs = [await db.get(AdmissionRequest, rid) for rid in requests.get(inst_id, [])]
+        places.append(
+            FamilyPlace(
+                institution_id=inst_id,
+                institution_name=inst.name,
+                teacher_name=owner,
+                bkash_number=inst.settings.get("bkash_number"),
+                children=[await _child_summary(db, k) for k in kids if k],
+                requests=[await admissions.request_out(db, r, inst.name) for r in reqs if r],
+            )
+        )
+    return FamilyOverview(places=places)

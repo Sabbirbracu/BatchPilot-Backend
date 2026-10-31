@@ -47,6 +47,30 @@ async def _student_outstanding(t: Tenant, student_id: uuid.UUID) -> int:
     )
 
 
+async def receipt_out(t: Tenant, res: service.PaymentResult) -> ReceiptOut:
+    p = res.payment
+    st = await t.db.get(Student, p.student_id)
+    receiver = await t.db.get(User, p.received_by)
+    return ReceiptOut(
+        payment_id=p.id,
+        student_id=st.id,
+        student_name=st.name,
+        student_code=st.student_code,
+        amount=p.amount,
+        method=p.method,
+        trx_id=p.trx_id,
+        received_at=p.received_at,
+        received_by_name=receiver.name if receiver else None,
+        allocations=[
+            AllocationOut(fee_due_id=d.id, month=d.month, kind=d.kind, label=d.label, batch_id=d.batch_id, amount=a, due_status=d.status)
+            for d, a in res.allocations
+        ],
+        outstanding_after=await _student_outstanding(t, st.id),
+        sms_status=res.sms_status,
+        replayed=res.replayed,
+    )
+
+
 @router.post("/payments", response_model=ReceiptOut, status_code=201)
 async def record_payment(
     body: PaymentIn,
@@ -64,34 +88,14 @@ async def record_payment(
         due_ids=body.due_ids,
         send_receipt=body.send_receipt,
     )
-    p = res.payment
-    st = await t.db.get(Student, p.student_id)
-    receiver = await t.db.get(User, p.received_by)
-    return ReceiptOut(
-        payment_id=p.id,
-        student_id=st.id,
-        student_name=st.name,
-        roll_no=st.roll_no,
-        amount=p.amount,
-        method=p.method,
-        trx_id=p.trx_id,
-        received_at=p.received_at,
-        received_by_name=receiver.name if receiver else None,
-        allocations=[
-            AllocationOut(fee_due_id=d.id, month=d.month, batch_id=d.batch_id, amount=a, due_status=d.status)
-            for d, a in res.allocations
-        ],
-        outstanding_after=await _student_outstanding(t, st.id),
-        sms_status=res.sms_status,
-        replayed=res.replayed,
-    )
+    return await receipt_out(t, res)
 
 
 async def _payments(t: Tenant, conds: list, limit: int) -> list[PaymentOut]:
     Rev = aliased(Payment)
     rows = (
         await t.db.execute(
-            select(Payment, Student.name, Student.roll_no, User.name, Rev.id)
+            select(Payment, Student.name, Student.student_code, User.name, Rev.id)
             .join(Student, Student.id == Payment.student_id)
             .join(User, User.id == Payment.received_by)
             .outerjoin(Rev, Rev.reverses_payment_id == Payment.id)
@@ -117,12 +121,12 @@ async def _payments(t: Tenant, conds: list, limit: int) -> list[PaymentOut]:
     ) if rows else {}
     return [
         PaymentOut(
-            id=p.id, student_id=p.student_id, student_name=sname, roll_no=roll, kind=p.kind, amount=p.amount,
+            id=p.id, student_id=p.student_id, student_name=sname, student_code=code, kind=p.kind, amount=p.amount,
             method=p.method, trx_id=p.trx_id, note=p.note, received_by=p.received_by, received_by_name=rname,
             received_at=p.received_at, reversed=rev_id is not None, reversal_reason=p.reversal_reason,
             months=months.get(p.id, []), batch_names=list(batch_names.get(p.student_id) or []),
         )
-        for p, sname, roll, rname, rev_id in rows
+        for p, sname, code, rname, rev_id in rows
     ]
 
 
@@ -218,7 +222,7 @@ async def list_dues(
         conds.append(FeeDue.batch_id == batch_id)
     if q and q.strip():
         like = f"%{q.strip()}%"
-        conds.append((Student.name.ilike(like)) | (Student.roll_no == q.strip()))
+        conds.append((Student.name.ilike(like)) | (Student.student_code == q.strip()))
     outstanding = func.sum(FeeDue.amount - FeeDue.discount - FeeDue.paid_amount)
     months = func.count(func.distinct(FeeDue.month))
     last_pay = (
@@ -229,7 +233,7 @@ async def list_dues(
     )
     grouped = (
         select(
-            Student.id, Student.name, Student.roll_no, Student.guardian_phone,
+            Student.id, Student.name, Student.student_code, Student.guardian_phone,
             func.array_agg(func.distinct(Batch.name)), outstanding.label("outstanding"),
             months.label("months"), func.min(FeeDue.month), last_pay,
         )
@@ -243,11 +247,11 @@ async def list_dues(
         grouped = grouped.having(months >= min_months)
     sub = grouped.subquery()
     totals = (await t.db.execute(select(func.count(), func.coalesce(func.sum(sub.c.outstanding), 0)).select_from(sub))).one()
-    rows = (await t.db.execute(grouped.order_by(outstanding.desc(), Student.roll_no).limit(limit).offset(offset))).all()
+    rows = (await t.db.execute(grouped.order_by(outstanding.desc(), Student.student_code).limit(limit).offset(offset))).all()
     return DuesPage(
         items=[
             DueStudentRow(
-                student_id=r[0], name=r[1], roll_no=r[2], guardian_phone=r[3], batch_names=list(r[4] or []),
+                student_id=r[0], name=r[1], student_code=r[2], guardian_phone=r[3], batch_names=list(r[4] or []),
                 outstanding=int(r[5]), months=int(r[6]), oldest_month=r[7], last_payment_at=r[8],
             )
             for r in rows
@@ -273,7 +277,7 @@ async def student_ledger(student_id: uuid.UUID, t: Tenant):
     cm = current_month()
     dues = [
         DueOut(
-            id=d.id, month=d.month, batch_id=d.batch_id, batch_name=bname, amount=d.amount, discount=d.discount,
+            id=d.id, month=d.month, kind=d.kind, label=d.label, batch_id=d.batch_id, batch_name=bname, amount=d.amount, discount=d.discount,
             discount_reason=d.discount_reason, paid_amount=d.paid_amount, outstanding=service.outstanding_of(d),
             status=d.status, due_date=d.due_date,
         )
@@ -290,7 +294,7 @@ async def discount_due(due_id: uuid.UUID, body: DiscountIn, t: Tenant):
     d = await service.set_discount(t, due_id, body.discount, body.reason)
     batch = await t.db.get(Batch, d.batch_id)
     return DueOut(
-        id=d.id, month=d.month, batch_id=d.batch_id, batch_name=batch.name if batch else "", amount=d.amount,
+        id=d.id, month=d.month, kind=d.kind, label=d.label, batch_id=d.batch_id, batch_name=batch.name if batch else "", amount=d.amount,
         discount=d.discount, discount_reason=d.discount_reason, paid_amount=d.paid_amount,
         outstanding=service.outstanding_of(d), status=d.status, due_date=d.due_date,
     )

@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime, time
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.academics.models import WEEKDAYS
 
@@ -16,6 +16,17 @@ class BatchIn(BaseModel):
     monthly_fee: int = Field(ge=0, description="poisha")
     admission_fee: int | None = Field(default=None, ge=0)
     capacity: int | None = Field(default=None, ge=1, le=1000)
+    fee_plan: str = Field(default="monthly", pattern="^(monthly|course)$")
+    course_fee: int | None = Field(default=None, ge=0, description="poisha; whole course")
+    installments: int = Field(default=1, ge=1, le=24)
+    location: str | None = Field(default=None, max_length=160)
+    starts_on: date | None = None
+
+    @model_validator(mode="after")
+    def _plan(self):
+        if self.fee_plan == "course" and not self.course_fee:
+            raise ValueError("course_fee is required for a course-fee batch")
+        return self
 
     @field_validator("days")
     @classmethod
@@ -30,7 +41,13 @@ class BatchUpdate(BatchIn):
     name: str | None = Field(default=None, min_length=1, max_length=120)  # type: ignore[assignment]
     monthly_fee: int | None = Field(default=None, ge=0)  # type: ignore[assignment]
     days: list[str] | None = None  # type: ignore[assignment]
+    fee_plan: str | None = Field(default=None, pattern="^(monthly|course)$")  # type: ignore[assignment]
+    installments: int | None = Field(default=None, ge=1, le=24)  # type: ignore[assignment]
     version: int | None = None
+
+    @model_validator(mode="after")
+    def _plan(self):  # the merged row is checked in the router
+        return self
 
 
 class BatchOut(BaseModel):
@@ -46,6 +63,11 @@ class BatchOut(BaseModel):
     monthly_fee: int
     admission_fee: int | None
     capacity: int | None
+    fee_plan: str
+    course_fee: int | None
+    installments: int
+    location: str | None
+    starts_on: date | None
     archived_at: datetime | None
     version: int
     # Live stats
@@ -63,7 +85,7 @@ class BatchMemberOut(BaseModel):
     """One row of a batch's student table: this month's fee for this batch and attendance here."""
 
     student_id: uuid.UUID
-    roll_no: str
+    student_code: str
     name: str
     guardian_phone: str | None
     month_amount: int = 0  # fee after discount, poisha; 0 when no due exists yet
@@ -75,21 +97,26 @@ class BatchMemberOut(BaseModel):
 
 class EnrollmentIn(BaseModel):
     batch_id: uuid.UUID
-    custom_fee: int | None = Field(default=None, ge=0, description="poisha; overrides batch fee")
+    custom_fee: int | None = Field(default=None, ge=0, description="poisha; overrides batch fee (monthly or course)")
     discount_note: str | None = Field(default=None, max_length=200)
     start_month: date | None = None
+    # One-time admission fee to charge now (None = none). Rejoining students are not charged by default.
+    admission_fee: int | None = Field(default=None, ge=0)
+    admission_discount: int = Field(default=0, ge=0)
+    fee_discount: int = Field(default=0, ge=0, description="off the first month, or off the course fee")
 
 
 class StudentIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     phone: str | None = None
     guardian_name: str | None = Field(default=None, max_length=120)
+    guardian_relation: str | None = Field(default=None, pattern="^(father|mother|other)$")
     guardian_phone: str | None = None
     school: str | None = Field(default=None, max_length=160)
     class_level: str | None = Field(default=None, max_length=60)
     joined_at: date | None = None
     note: str | None = None
-    roll_no: str | None = Field(default=None, max_length=30)
+    student_code: str | None = Field(default=None, max_length=30)
     enrollments: list[EnrollmentIn] = Field(default_factory=list)
     force: bool = False  # create even if a likely duplicate exists
 
@@ -98,6 +125,7 @@ class StudentUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     phone: str | None = None
     guardian_name: str | None = None
+    guardian_relation: str | None = Field(default=None, pattern="^(father|mother|other)$")
     guardian_phone: str | None = None
     school: str | None = None
     class_level: str | None = None
@@ -120,10 +148,11 @@ class StudentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
-    roll_no: str
+    student_code: str
     name: str
     phone: str | None
     guardian_name: str | None
+    guardian_relation: str | None = None
     guardian_phone: str | None
     guardian_verified_at: datetime | None
     school: str | None

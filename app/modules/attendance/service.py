@@ -42,8 +42,8 @@ async def enrolled_students(db: AsyncSession, batch_id: uuid.UUID) -> list[Stude
                     Student.status == "active",
                     Student.deleted_at.is_(None),
                 )
-                # Natural roll order: "2" before "10".
-                .order_by(func.length(Student.roll_no), Student.roll_no)
+                # Numeric order: "2" before "10".
+                .order_by(func.length(Student.student_code), Student.student_code)
             )
         ).scalars()
     )
