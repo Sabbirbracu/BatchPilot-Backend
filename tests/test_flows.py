@@ -288,3 +288,14 @@ async def test_notice_templates_audience_and_scheduled_notice(owner):
     ov = (await owner.get(f"{V1}/messages/overview")).json()
     assert ov["scheduled_notices"] == 1 and ov["counts"]["notice"] == 1
     assert ov["counts"]["welcome"] == 1 and a["name"] == "Tania"
+
+
+async def test_batch_mode_defaults_offline_and_saves_online(owner):
+    r = await owner.post(f"{V1}/batches", json={"name": "Mode A", "monthly_fee": 50000})
+    assert r.status_code == 201 and r.json()["mode"] == "offline"
+    r = await owner.post(f"{V1}/batches", json={"name": "Mode B", "monthly_fee": 50000, "mode": "online"})
+    assert r.status_code == 201 and r.json()["mode"] == "online"
+    bid = r.json()["id"]
+    assert (await owner.patch(f"{V1}/batches/{bid}", json={"name": "Mode B2"})).json()["mode"] == "online"
+    assert (await owner.patch(f"{V1}/batches/{bid}", json={"mode": "offline"})).json()["mode"] == "offline"
+    assert (await owner.post(f"{V1}/batches", json={"name": "X", "monthly_fee": 1, "mode": "hybrid"})).status_code == 422

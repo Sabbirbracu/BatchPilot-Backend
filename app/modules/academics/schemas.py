@@ -20,6 +20,7 @@ class BatchIn(BaseModel):
     course_fee: int | None = Field(default=None, ge=0, description="poisha; whole course")
     installments: int = Field(default=1, ge=1, le=24)
     location: str | None = Field(default=None, max_length=160)
+    mode: str = Field(default="offline", pattern="^(offline|online)$")
     starts_on: date | None = None
 
     @model_validator(mode="after")
@@ -43,6 +44,7 @@ class BatchUpdate(BatchIn):
     days: list[str] | None = None  # type: ignore[assignment]
     fee_plan: str | None = Field(default=None, pattern="^(monthly|course)$")  # type: ignore[assignment]
     installments: int | None = Field(default=None, ge=1, le=24)  # type: ignore[assignment]
+    mode: str | None = Field(default=None, pattern="^(offline|online)$")  # type: ignore[assignment]
     version: int | None = None
 
     @model_validator(mode="after")
@@ -67,6 +69,7 @@ class BatchOut(BaseModel):
     course_fee: int | None
     installments: int
     location: str | None
+    mode: str
     starts_on: date | None
     archived_at: datetime | None
     version: int

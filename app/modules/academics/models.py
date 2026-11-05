@@ -21,6 +21,7 @@ from app.core.db import Base, IdMixin, SoftDeleteMixin, TimestampMixin
 
 WEEKDAYS = ("sat", "sun", "mon", "tue", "wed", "thu", "fri")
 FEE_PLANS = ("monthly", "course")  # course = one fee for the whole course, paid at once or in instalments
+BATCH_MODES = ("offline", "online")  # where the class happens
 
 
 class Batch(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -42,6 +43,7 @@ class Batch(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
     course_fee: Mapped[int | None] = mapped_column(BigInteger)  # poisha; fee_plan == "course"
     installments: Mapped[int] = mapped_column(SmallInteger, default=1, server_default="1", nullable=False)
     location: Mapped[str | None] = mapped_column(String(160))  # shown on admission pages
+    mode: Mapped[str] = mapped_column(String(10), default="offline", server_default="offline", nullable=False)
     starts_on: Mapped[date | None] = mapped_column(Date)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)

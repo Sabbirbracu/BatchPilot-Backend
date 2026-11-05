@@ -31,7 +31,7 @@ router = APIRouter(tags=["academics"])
 
 BATCH_FIELDS = [
     "name", "subject", "class_level", "days", "start_time", "end_time", "monthly_fee", "admission_fee", "capacity",
-    "fee_plan", "course_fee", "installments", "location", "starts_on",
+    "fee_plan", "course_fee", "installments", "location", "mode", "starts_on",
 ]
 NULLABLE_BATCH_FIELDS = ("subject", "class_level", "start_time", "end_time", "admission_fee", "capacity", "course_fee", "location", "starts_on")
 
